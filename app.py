@@ -7,25 +7,53 @@ import random
 
 app = Flask(__name__)
 
-# --- 1. ROAD NETWORK INITIALIZATION (Runs once at startup) ---
-print("Loading targeted road network into memory...")
-place = "Aluva, Kerala, India"  # Tighter boundary ensures it downloads in seconds
-graph = ox.graph_from_place(place, network_type="drive")
-print("Road network loaded successfully!")
+graph = None
+geolocator = None
 
-# Simulating ML risk variables on the graph edges
-for u, v, key, data in graph.edges(keys=True, data=True):
-    mock_elevation = random.uniform(1.0, 30.0)
-    mock_river_proximity = random.uniform(0.0, 3.0)
-    
-    if mock_elevation < 10.0 and mock_river_proximity < 1.2:
-        flood_probability = random.uniform(0.75, 1.0)
-    else:
-        flood_probability = random.uniform(0.0, 0.25)
-        
-    data['flood_risk'] = flood_probability
-    penalty_factor = 15.0 
-    data['risk_adjusted_weight'] = data['length'] * (1 + penalty_factor * flood_probability)
+
+def load_graph():
+    global graph
+    if graph is not None:
+        return graph
+
+    try:
+        print("Loading targeted road network into memory...")
+        place = "Aluva, Kerala, India"
+        graph = ox.graph_from_place(place, network_type="drive")
+        print("Road network loaded successfully!")
+
+        for u, v, key, data in graph.edges(keys=True, data=True):
+            mock_elevation = random.uniform(1.0, 30.0)
+            mock_river_proximity = random.uniform(0.0, 3.0)
+
+            if mock_elevation < 10.0 and mock_river_proximity < 1.2:
+                flood_probability = random.uniform(0.75, 1.0)
+            else:
+                flood_probability = random.uniform(0.0, 0.25)
+
+            data['flood_risk'] = flood_probability
+            penalty_factor = 15.0
+            data['risk_adjusted_weight'] = data['length'] * (1 + penalty_factor * flood_probability)
+
+        return graph
+    except Exception as exc:
+        print(f"Warning: Unable to load road network: {exc}")
+        return None
+
+
+def get_geolocator():
+    global geolocator
+    if geolocator is None:
+        geolocator = Nominatim(user_agent="kerala_flood_web")
+    return geolocator
+
+
+def geocode_location(query):
+    try:
+        return get_geolocator().geocode(query)
+    except Exception as exc:
+        print(f"Warning: Geocoding failed for {query}: {exc}")
+        return None
 
 # --- 2. FRONTEND HTML INTERFACE DESIGN (Embedded directly as a string) ---
 HTML_INTERFACE = """
@@ -64,41 +92,45 @@ HTML_INTERFACE = """
 # --- 3. FLASK ROUTING ENDPOINTS ---
 @app.route('/')
 def home():
-    # Renders the HTML layout string directly without needing a templates folder
-    return render_template_string(HTML_INTERFACE)
+    with app.app_context():
+        return render_template_string(HTML_INTERFACE)
 
 @app.route('/get_route', methods=['POST'])
 def get_route():
-    source = request.form.get('source')
-    destination = request.form.get('destination')
-    
-    geolocator = Nominatim(user_agent="kerala_flood_web")
-    source_loc = geolocator.geocode(source + ", Aluva, Kerala")
-    dest_loc = geolocator.geocode(destination + ", Aluva, Kerala")
-    
+    source = request.form.get('source', '').strip()
+    destination = request.form.get('destination', '').strip()
+
+    if not source or not destination:
+        return "<h3>Error: Please enter both a starting location and a destination shelter.</h3>"
+
+    network_graph = load_graph()
+    if network_graph is None:
+        return "<h3>Service unavailable: the road network could not be loaded right now. Please try again shortly.</h3>"
+
+    source_loc = geocode_location(source + ", Aluva, Kerala")
+    dest_loc = geocode_location(destination + ", Aluva, Kerala")
+
     if not source_loc or not dest_loc:
         return "<h3>Error: One or both locations could not be verified in the local target area. Go back and try again.</h3>"
-    
+
     try:
-        orig = ox.distance.nearest_nodes(graph, X=source_loc.longitude, Y=source_loc.latitude)
-        dest = ox.distance.nearest_nodes(graph, X=dest_loc.longitude, Y=dest_loc.latitude)
-        
-        # Pathfinding: Standard vs AI Risk-Adjusted
-        standard_route = nx.shortest_path(graph, orig, dest, weight="length")
-        ai_evac_route = nx.shortest_path(graph, orig, dest, weight="risk_adjusted_weight")
-        
-        # Interactive Map Layer Assembly
+        orig = ox.distance.nearest_nodes(network_graph, X=source_loc.longitude, Y=source_loc.latitude)
+        dest = ox.distance.nearest_nodes(network_graph, X=dest_loc.longitude, Y=dest_loc.latitude)
+
+        standard_route = nx.shortest_path(network_graph, orig, dest, weight="length")
+        ai_evac_route = nx.shortest_path(network_graph, orig, dest, weight="risk_adjusted_weight")
+
         m = folium.Map(location=[source_loc.latitude, source_loc.longitude], zoom_start=14)
-        
+
         folium.Marker([source_loc.latitude, source_loc.longitude], popup="START", icon=folium.Icon(color="green")).add_to(m)
         folium.Marker([dest_loc.latitude, dest_loc.longitude], popup="SHELTER", icon=folium.Icon(color="red")).add_to(m)
-        
-        std_coords = [(graph.nodes[node]['y'], graph.nodes[node]['x']) for node in standard_route]
+
+        std_coords = [(network_graph.nodes[node]['y'], network_graph.nodes[node]['x']) for node in standard_route]
         folium.PolyLine(std_coords, color="red", weight=3, opacity=0.5, dash_array='5,5', tooltip="Standard Distance Path").add_to(m)
-        
-        evac_coords = [(graph.nodes[node]['y'], graph.nodes[node]['x']) for node in ai_evac_route]
+
+        evac_coords = [(network_graph.nodes[node]['y'], network_graph.nodes[node]['x']) for node in ai_evac_route]
         folium.PolyLine(evac_coords, color="blue", weight=6, opacity=0.9, tooltip="AI Recommended Safe Route").add_to(m)
-        
+
         return m._repr_html_()
     except Exception as e:
         return f"<h3>Routing Error: Could not compute paths between these points. Details: {str(e)}</h3>"
